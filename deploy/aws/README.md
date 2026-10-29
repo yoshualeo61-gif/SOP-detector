@@ -40,7 +40,9 @@ terraform apply -target=aws_ecr_repository.sop_detector
 REPO=$(terraform output -raw ecr_repository_url)
 cd -
 
-# 2. Build the image (about 4.5 GB) and push it
+# 2. Build the image (about 4.5 GB) and push it.
+#    Without Docker: run the "Build and push image" workflow (GitHub -> Actions) instead,
+#    after adding the repository secrets AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
 docker build -t sop-detector:latest .
 aws ecr get-login-password --region ap-southeast-1 | \
     docker login --username AWS --password-stdin "${REPO%%/*}"
