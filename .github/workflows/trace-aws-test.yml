@@ -1,0 +1,123 @@
+name: Test TRACE with the SOP detector
+
+# Builds the TRACE backend image from laxmi1707/PatternRecognSystem-Video2Text main with
+# trace-pr/ applied, as merging that pull request would and as its deploy-backend.yml
+# builds it, then runs it at the AWS backend task's size (2 vCPU, 8 GB, no swap) and checks
+# what the AWS site relies on: both services answer, a stored sample comes back at once,
+# a new video is read in full, and the Amplify site's origin passes CORS.
+# Nothing is pushed or deployed; TRACE is only read.
+
+on:
+  push:
+    branches: [trace-aws-test]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      PATCH: trace-pr/0001-feat-sop-detector-run-the-SOP-detector-inside-the-ba.patch
+      SITE: https://main.d2tjfo3h4t5uox.amplifyapp.com
+      URL: http://localhost:8000
+      SAMPLE: trace/SOP-detector/samples/Eclipse_52907.mp4
+    steps:
+      - name: Checkout this branch (the patch)
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - name: Checkout TRACE main
+        uses: actions/checkout@v4
+        with:
+          repository: laxmi1707/PatternRecognSystem-Video2Text
+          ref: main
+          path: trace
+
+      - name: Apply the patch, as merging the pull request would
+        working-directory: trace
+        run: |
+          git -c user.name=test -c user.email=test@example.invalid am "$GITHUB_WORKSPACE/self/$PATCH"
+          git log -2 --format='%h %s'
+
+      # Two ML environments (the backend's and the detector's) make the image several GB;
+      # the runner only has ~14 GB free by default.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h /
+
+      - name: Build the image as deploy-backend.yml does
+        working-directory: trace/SourceCode/backend
+        run: |
+          docker build --build-context sop-detector=../../SOP-detector -t backend:test .
+          docker image ls backend:test
+
+      # SQLite and no S3, as there is no database or AWS access here; the backend still
+      # warms up its OCR reader at startup, as on AWS.
+      - name: Start it at the AWS task's size (2 vCPU, 8 GB, no swap)
+        run: |
+          docker run -d --name backend --cpus 2 --memory 8g --memory-swap 8g -p 8000:8000 \
+            -e DATABASE_URL=sqlite+aiosqlite:////app/video2text.db -e MODEL_S3_BUCKET= \
+            -e ALLOWED_ORIGINS="[\"$SITE\"]" backend:test
+          nohup sh -c 'while sleep 5; do docker stats --no-stream --format "{{.MemPerc}} {{.MemUsage}}" backend >> /tmp/mem.log 2>/dev/null; done' > /dev/null 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf "$URL/health" > /dev/null && curl -sf "$URL/sop-detector/health"; then
+              echo; echo "backend and SOP detector both answer after about $((i * 5)) s"; exit 0
+            fi
+            sleep 5
+          done
+          echo "not up within 5 minutes"; docker logs backend 2>&1 | tail -80; exit 1
+
+      - name: A stored sample comes back at once
+        run: |
+          id=$(curl -sf -F "file=@$SAMPLE;type=video/mp4" "$URL/sop-detector/jobs" | jq -r .job_id)
+          for i in $(seq 1 30); do
+            job=$(curl -sf "$URL/sop-detector/jobs/$id"); status=$(echo "$job" | jq -r .status)
+            [ "$status" != running ] && break
+            sleep 2
+          done
+          echo "$job" | jq '{status, error, app: .result.app, steps: .result.steps}'
+          [ "$status" = completed ]
+
+      - name: A new video is read in full on 2 vCPU
+        timeout-minutes: 60
+        run: |
+          # The same frames with a different file hash, so no stored result matches.
+          if command -v ffmpeg > /dev/null; then
+            ffmpeg -loglevel error -i "$SAMPLE" -map 0 -c copy -metadata comment=new /tmp/new.mp4
+          else
+            cp "$SAMPLE" /tmp/new.mp4 && printf 'new' >> /tmp/new.mp4
+          fi
+          start=$(date +%s)
+          id=$(curl -sf -F "file=@/tmp/new.mp4;type=video/mp4" "$URL/sop-detector/jobs" | jq -r .job_id)
+          echo "upload answered in $(( $(date +%s) - start )) s (CloudFront waits up to 60 s)"
+          while :; do
+            job=$(curl -sf "$URL/sop-detector/jobs/$id") || { echo "the detector stopped answering"; exit 1; }
+            status=$(echo "$job" | jq -r .status)
+            [ "$status" != running ] && break
+            echo "$(( $(date +%s) - start )) s: $(echo "$job" | jq -r '"\(.progress_pct)% \(.stage)"')"
+            sleep 30
+          done
+          echo "finished in $(( $(date +%s) - start )) s"
+          echo "$job" | jq '{status, error, app: .result.app, steps: .result.steps}'
+          [ "$status" = completed ]
+
+      - name: The Amplify site's origin passes CORS
+        run: |
+          curl -si -X OPTIONS "$URL/sop-detector/jobs" -H "Origin: $SITE" \
+            -H 'Access-Control-Request-Method: POST' -H 'Access-Control-Request-Headers: x-api-key' \
+            | tee /tmp/cors.txt | head -12
+          grep -qi "access-control-allow-origin: $SITE" /tmp/cors.txt
+
+      - name: Memory, restarts and logs
+        if: always()
+        run: |
+          echo "highest memory use seen (of 8 GB): $(sort -n /tmp/mem.log 2>/dev/null | tail -1)"
+          echo "container OOM-killed: $(docker inspect -f '{{.State.OOMKilled}}' backend 2>/dev/null)"
+          echo "detector restarts: $(docker logs backend 2>&1 | grep -c 'SOP detector stopped')"
+          docker logs backend 2>&1 | tail -60
