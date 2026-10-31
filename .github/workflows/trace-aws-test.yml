@@ -1,11 +1,14 @@
 name: Test TRACE with the SOP detector
 
-# Builds the TRACE backend image from laxmi1707/PatternRecognSystem-Video2Text main with
-# trace-pr/ applied, as merging that pull request would and as its deploy-backend.yml
-# builds it, then runs it at the AWS backend task's size (2 vCPU, 8 GB, no swap) and checks
-# what the AWS site relies on: both services answer, a stored sample comes back at once,
-# a new video is read in full, and the Amplify site's origin passes CORS.
-# Nothing is pushed or deployed; TRACE is only read.
+# Tests laxmi1707/PatternRecognSystem-Video2Text main with trace-pr/ applied, as merging
+# that pull request would, and as its pipelines would build it:
+# - backend-tests: deploy-backend.yml's test job (ruff, mypy, pytest), which gates its deploy;
+# - frontend: the Amplify build (npm ci, npm run build), plus the frontend's tests;
+# - build-and-run: the image as deploy-backend.yml builds it, run at the AWS backend task's
+#   size (2 vCPU, 8 GB, no swap): both services answer, a stored sample comes back, a new
+#   video is read in full alone and while the backend analyses it too, and the Amplify
+#   site's origin passes CORS.
+# Results are written as annotations. Nothing is pushed or deployed; TRACE is only read.
 
 on:
   push:
@@ -15,12 +18,90 @@ on:
 permissions:
   contents: read
 
+env:
+  PATCH: trace-pr/0001-feat-sop-detector-run-the-SOP-detector-inside-the-ba.patch
+
 jobs:
+  backend-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this branch (the patch)
+        uses: actions/checkout@v4
+        with:
+          path: self
+      - name: Checkout TRACE main
+        uses: actions/checkout@v4
+        with:
+          repository: laxmi1707/PatternRecognSystem-Video2Text
+          ref: main
+          path: trace
+      - name: Apply the patch
+        working-directory: trace
+        run: git -c user.name=test -c user.email=test@example.invalid am "$GITHUB_WORKSPACE/self/$PATCH"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # The same commands as deploy-backend.yml's test job.
+      - name: Install dependencies
+        working-directory: trace/SourceCode/backend
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[ml,aws,dev]"
+      - name: Lint
+        working-directory: trace/SourceCode/backend
+        run: ruff check app/
+      - name: Type check
+        continue-on-error: true
+        working-directory: trace/SourceCode/backend
+        run: mypy app/ --ignore-missing-imports
+      - name: Run tests
+        working-directory: trace/SourceCode/backend
+        run: |
+          pytest tests/ -x -q | tee /tmp/pytest.txt
+          echo "::notice title=Backend tests (deploy gate)::$(tail -1 /tmp/pytest.txt)"
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this branch (the patch)
+        uses: actions/checkout@v4
+        with:
+          path: self
+      - name: Checkout TRACE main
+        uses: actions/checkout@v4
+        with:
+          repository: laxmi1707/PatternRecognSystem-Video2Text
+          ref: main
+          path: trace
+      - name: Apply the patch
+        working-directory: trace
+        run: git -c user.name=test -c user.email=test@example.invalid am "$GITHUB_WORKSPACE/self/$PATCH"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Tests
+        working-directory: trace/SourceCode/frontend
+        run: |
+          npm ci
+          npx vitest run | tee /tmp/vitest.txt
+          echo "::notice title=Frontend tests::$(grep -E '^ +Tests ' /tmp/vitest.txt | tr -s ' ')"
+      # amplify.yml's build, with the backend URL the site uses
+      - name: Amplify build
+        working-directory: trace/SourceCode/frontend
+        env:
+          VITE_API_BASE_URL: https://d3aev25xtfpx7z.cloudfront.net/api/v1
+        run: |
+          npm run build
+          js=$(ls dist/assets/index-*.js)
+          grep -q 'cloudfront.net/sop-detector' <<< "$(node -e 'const s=require("fs").readFileSync(process.argv[1],"utf8"); const i=s.indexOf("/sop-detector"); console.log(s.slice(i-200,i+40))' "$js")" \
+            || { echo "the bundle does not call the detector on the backend's host"; exit 1; }
+          echo "::notice title=Amplify build::builds; the panel is on and calls https://d3aev25xtfpx7z.cloudfront.net/sop-detector"
+
   build-and-run:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 170
     env:
-      PATCH: trace-pr/0001-feat-sop-detector-run-the-SOP-detector-inside-the-ba.patch
       SITE: https://main.d2tjfo3h4t5uox.amplifyapp.com
       URL: http://localhost:8000
       SAMPLE: trace/SOP-detector/samples/Eclipse_52907.mp4
@@ -29,14 +110,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: self
-
       - name: Checkout TRACE main
         uses: actions/checkout@v4
         with:
           repository: laxmi1707/PatternRecognSystem-Video2Text
           ref: main
           path: trace
-
       - name: Apply the patch, as merging the pull request would
         working-directory: trace
         run: |
@@ -55,19 +134,20 @@ jobs:
         working-directory: trace/SourceCode/backend
         run: |
           docker build --build-context sop-detector=../../SOP-detector -t backend:test .
-          docker image ls backend:test
+          size=$(docker image inspect -f '{{.Size}}' backend:test)
+          echo "::notice title=Image size::$(awk -v b="$size" 'BEGIN{printf "%.1f GB", b/1e9}') (AWS Fargate gives the task 20 GB of disk by default)"
 
       # SQLite and no S3, as there is no database or AWS access here; the backend still
-      # warms up its OCR reader at startup, as on AWS.
+      # warms up at startup, as on AWS.
       - name: Start it at the AWS task's size (2 vCPU, 8 GB, no swap)
         run: |
           docker run -d --name backend --cpus 2 --memory 8g --memory-swap 8g -p 8000:8000 \
             -e DATABASE_URL=sqlite+aiosqlite:////app/video2text.db -e MODEL_S3_BUCKET= \
             -e ALLOWED_ORIGINS="[\"$SITE\"]" backend:test
-          nohup sh -c 'while sleep 5; do docker stats --no-stream --format "{{.MemPerc}} {{.MemUsage}}" backend >> /tmp/mem.log 2>/dev/null; done' > /dev/null 2>&1 &
+          nohup sh -c 'while sleep 3; do docker stats --no-stream --format "{{.MemPerc}} {{.MemUsage}}" backend >> /tmp/mem.log 2>/dev/null; done' > /dev/null 2>&1 &
           for i in $(seq 1 60); do
             if curl -sf "$URL/health" > /dev/null && curl -sf "$URL/sop-detector/health"; then
-              echo; echo "backend and SOP detector both answer after about $((i * 5)) s"; exit 0
+              echo; echo "::notice title=Start::backend and SOP detector both answer after about $((i * 5)) s"; exit 0
             fi
             sleep 5
           done
@@ -83,29 +163,55 @@ jobs:
           done
           echo "$job" | jq '{status, error, app: .result.app, steps: .result.steps}'
           [ "$status" = completed ]
+          echo "::notice title=Stored sample::$(echo "$job" | jq -r '"\(.status): \(.result.app), \(.result.steps | length) steps"')"
 
       - name: A new video is read in full on 2 vCPU
         timeout-minutes: 60
         run: |
           # The same frames with a different file hash, so no stored result matches.
-          if command -v ffmpeg > /dev/null; then
-            ffmpeg -loglevel error -i "$SAMPLE" -map 0 -c copy -metadata comment=new /tmp/new.mp4
-          else
-            cp "$SAMPLE" /tmp/new.mp4 && printf 'new' >> /tmp/new.mp4
-          fi
+          cp "$SAMPLE" /tmp/new.mp4 && printf 'new' >> /tmp/new.mp4
           start=$(date +%s)
           id=$(curl -sf -F "file=@/tmp/new.mp4;type=video/mp4" "$URL/sop-detector/jobs" | jq -r .job_id)
-          echo "upload answered in $(( $(date +%s) - start )) s (CloudFront waits up to 60 s)"
+          up=$(( $(date +%s) - start ))
           while :; do
             job=$(curl -sf "$URL/sop-detector/jobs/$id") || { echo "the detector stopped answering"; exit 1; }
             status=$(echo "$job" | jq -r .status)
             [ "$status" != running ] && break
             echo "$(( $(date +%s) - start )) s: $(echo "$job" | jq -r '"\(.progress_pct)% \(.stage)"')"
-            sleep 30
+            sleep 20
           done
-          echo "finished in $(( $(date +%s) - start )) s"
           echo "$job" | jq '{status, error, app: .result.app, steps: .result.steps}'
+          echo "::notice title=New 44 s video, detector alone::$status in $(( $(date +%s) - start )) s, $(echo "$job" | jq -r '.result.steps | length') steps; upload answered in ${up} s (CloudFront waits up to 60 s)"
           [ "$status" = completed ]
+
+      # What the site does on every upload: the backend analyses the video while the
+      # detector reads it. There are no trained models here (they are in S3), so the
+      # backend's classification has nothing to run, but its feature extraction does.
+      - name: The backend and the detector on one new video at once
+        timeout-minutes: 80
+        run: |
+          cp "$SAMPLE" /tmp/both.mp4 && printf 'both' >> /tmp/both.mp4
+          start=$(date +%s)
+          bjob=$(curl -sf -F "file=@/tmp/both.mp4;type=video/mp4" "$URL/api/v1/videos/upload" | jq -r .job_id)
+          curl -sf -X POST "$URL/api/v1/jobs/$bjob/run" > /dev/null
+          did=$(curl -sf -F "file=@/tmp/both.mp4;type=video/mp4" "$URL/sop-detector/jobs" | jq -r .job_id)
+          bdone=""; ddone=""; b=""; d=""
+          while [ -z "$bdone" ] || [ -z "$ddone" ]; do
+            t=$(( $(date +%s) - start ))
+            if [ -z "$bdone" ]; then
+              b=$(curl -sf "$URL/api/v1/jobs/$bjob" | jq -r '"\(.status) \(.progress_stage)"') || b="unreachable"
+              case "$b" in completed*|failed*) bdone="$b after ${t} s";; esac
+            fi
+            if [ -z "$ddone" ]; then
+              d=$(curl -sf "$URL/sop-detector/jobs/$did" | jq -r .status) || { echo "the detector stopped answering"; exit 1; }
+              case "$d" in completed|failed) ddone="$d after ${t} s";; esac
+            fi
+            echo "${t} s: backend $b | detector $d"
+            sleep 20
+          done
+          echo "::notice title=Backend and detector at once::detector $ddone; backend job $bdone"
+          curl -sf "$URL/health" > /dev/null && echo "::notice title=Backend after both::still answers /health"
+          case "$ddone" in completed*) ;; *) exit 1;; esac
 
       - name: The Amplify site's origin passes CORS
         run: |
@@ -113,11 +219,12 @@ jobs:
             -H 'Access-Control-Request-Method: POST' -H 'Access-Control-Request-Headers: x-api-key' \
             | tee /tmp/cors.txt | head -12
           grep -qi "access-control-allow-origin: $SITE" /tmp/cors.txt
+          echo "::notice title=CORS::requests from $SITE are allowed"
 
       - name: Memory, restarts and logs
         if: always()
         run: |
-          echo "highest memory use seen (of 8 GB): $(sort -n /tmp/mem.log 2>/dev/null | tail -1)"
-          echo "container OOM-killed: $(docker inspect -f '{{.State.OOMKilled}}' backend 2>/dev/null)"
-          echo "detector restarts: $(docker logs backend 2>&1 | grep -c 'SOP detector stopped')"
-          docker logs backend 2>&1 | tail -60
+          peak=$(sort -n /tmp/mem.log 2>/dev/null | tail -1)
+          restarts=$(docker logs backend 2>&1 | grep -c 'SOP detector stopped' || true)
+          echo "::notice title=Memory and restarts::peak ${peak:-unknown} of the 8 GB limit; container OOM-killed: $(docker inspect -f '{{.State.OOMKilled}}' backend 2>/dev/null); detector restarts: ${restarts}"
+          docker logs backend 2>&1 | tail -80
