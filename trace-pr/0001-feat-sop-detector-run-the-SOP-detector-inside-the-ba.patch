@@ -1,0 +1,663 @@
+From e25cc7a1ceedb4d28219dfc55984ff89833cd6d9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 09:05:51 +0000
+Subject: [PATCH] feat(sop-detector): run the SOP detector inside the backend
+ container on AWS
+
+The AWS site only deploys the backend (deploy-backend.yml), so the SOP
+detector, which works on the local site, never reached it. Merging this
+puts it there without any AWS changes:
+
+- SourceCode/backend/Dockerfile installs the detector beside the backend,
+  with its own Python 3.14 virtualenv (its models need the exact library
+  versions in its requirements.txt), when the build is given
+  --build-context sop-detector=../../SOP-detector. Without it the image is
+  the backend alone, as before.
+- start.sh starts the detector on 127.0.0.1:8100, again if it stops, and
+  then the backend.
+- app/routers/sop_detector.py forwards /sop-detector/* to it, with the
+  backend's upload limit and API key check; 503 while it is not running.
+- deploy-backend.yml passes the folder to the build and also redeploys on
+  changes under SOP-detector/. build-backend-image.yml builds and starts
+  the image on pull requests, without pushing anything.
+- The frontend's production build turns the detector panel on
+  (.env.production) and calls /sop-detector on the backend's host, taken
+  from VITE_API_BASE_URL, with the API key like the other calls.
+
+The detector shares the backend task's CPUs at a lower priority, so a new
+video takes longer than on a machine of its own; videos it has already
+read are answered at once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01G89XPgxU6v2S29VPSqNRBt
+---
+ .github/workflows/build-backend-image.yml     |  51 +++++++
+ .github/workflows/deploy-backend.yml          |   6 +-
+ SOP-detector/README.md                        |   9 ++
+ SourceCode/backend/Dockerfile                 |  47 ++++++-
+ SourceCode/backend/app/config.py              |   4 +
+ SourceCode/backend/app/main.py                |   4 +-
+ .../backend/app/routers/sop_detector.py       |  66 +++++++++
+ SourceCode/backend/pyproject.toml             |   2 +
+ SourceCode/backend/start.sh                   |  22 +++
+ .../backend/tests/test_sop_detector_proxy.py  | 127 ++++++++++++++++++
+ SourceCode/frontend/.env.production           |   5 +
+ .../frontend/src/services/api/client.ts       |   2 +-
+ .../src/services/api/sopDetector.test.ts      |  48 ++++++-
+ .../frontend/src/services/api/sopDetector.ts  |  32 +++--
+ 14 files changed, 410 insertions(+), 15 deletions(-)
+ create mode 100644 .github/workflows/build-backend-image.yml
+ create mode 100644 SourceCode/backend/app/routers/sop_detector.py
+ create mode 100644 SourceCode/backend/start.sh
+ create mode 100644 SourceCode/backend/tests/test_sop_detector_proxy.py
+ create mode 100644 SourceCode/frontend/.env.production
+
+diff --git a/.github/workflows/build-backend-image.yml b/.github/workflows/build-backend-image.yml
+new file mode 100644
+index 0000000..1527aac
+--- /dev/null
++++ b/.github/workflows/build-backend-image.yml
+@@ -0,0 +1,51 @@
++name: Build backend image
++
++# On pull requests: build the serving image the way deploy-backend.yml does, with the SOP
++# detector beside the backend, then start it and check that the backend and the detector
++# both answer. Nothing is pushed or deployed, so it needs no AWS access.
++
++on:
++  pull_request:
++    paths:
++      - "SourceCode/backend/**"
++      - "SOP-detector/**"
++      - ".github/workflows/build-backend-image.yml"
++  workflow_dispatch: {}
++
++permissions:
++  contents: read
++
++jobs:
++  build-and-start:
++    runs-on: ubuntu-latest
++    timeout-minutes: 90
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      # The image is CPU-only (Fargate has no GPU), but torch + easyocr + ultralytics,
++      # twice over with the detector's own environment, make it several GB; the runner
++      # only has ~14 GB free by default.
++      - name: Free disk space
++        run: |
++          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
++          docker system prune -af
++          df -h /
++
++      - name: Build image
++        working-directory: SourceCode/backend
++        run: docker build --build-context sop-detector=../../SOP-detector -t backend:check .
++
++      # SQLite and no S3 or warm-up, as there is no database or AWS access here.
++      - name: Start it and check both answer
++        run: |
++          docker run -d --name backend -p 8000:8000 \
++            -e DATABASE_URL=sqlite+aiosqlite:////app/video2text.db \
++            -e MODEL_S3_BUCKET= -e WARMUP_ON_STARTUP=false backend:check
++          for i in $(seq 1 60); do
++            if curl -sf http://localhost:8000/health && curl -sf http://localhost:8000/sop-detector/health; then
++              echo; echo "backend and SOP detector are up"; exit 0
++            fi
++            sleep 5
++          done
++          echo "did not answer within 5 minutes"; docker logs backend | tail -80; exit 1
+diff --git a/.github/workflows/deploy-backend.yml b/.github/workflows/deploy-backend.yml
+index 29e7253..ce7b1cb 100644
+--- a/.github/workflows/deploy-backend.yml
++++ b/.github/workflows/deploy-backend.yml
+@@ -5,6 +5,8 @@ on:
+     branches: [main]
+     paths:
+       - "SourceCode/backend/**"
++      # the SOP detector runs inside the backend's image (SourceCode/backend/Dockerfile)
++      - "SOP-detector/**"
+       - ".github/workflows/deploy-backend.yml"
+   workflow_dispatch: {}
+ 
+@@ -83,8 +85,10 @@ jobs:
+           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+           REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+           IMAGE_TAG: ${{ github.sha }}
++        # --build-context puts the SOP detector into the image, beside the backend
+         run: |
+-          docker build -t "$REGISTRY/$REPOSITORY:$IMAGE_TAG" -t "$REGISTRY/$REPOSITORY:latest" .
++          docker build --build-context sop-detector=../../SOP-detector \
++            -t "$REGISTRY/$REPOSITORY:$IMAGE_TAG" -t "$REGISTRY/$REPOSITORY:latest" .
+           docker push "$REGISTRY/$REPOSITORY:$IMAGE_TAG"
+           docker push "$REGISTRY/$REPOSITORY:latest"
+ 
+diff --git a/SOP-detector/README.md b/SOP-detector/README.md
+index ee295dd..8854616 100644
+--- a/SOP-detector/README.md
++++ b/SOP-detector/README.md
+@@ -93,6 +93,15 @@ python -m detector path/to/video.mp4 --out steps.json     # one video, steps as
+ python sop_detector_service.py                            # the service on port 8100
+ ```
+ 
++**On AWS** it runs inside the backend's container, beside the backend, so it is deployed
++with it: a merge to main that changes this folder or the backend redeploys both
++(`.github/workflows/deploy-backend.yml`). `SourceCode/backend/Dockerfile` installs it with
++its own Python 3.14 when the build is given this folder
++(`--build-context sop-detector=../../SOP-detector`), `start.sh` starts it on
++127.0.0.1:8100, and the backend forwards `/sop-detector/*` to it. It shares the backend
++task's CPUs at a lower priority, so a new video takes longer than on its own machine.
++`deploy/aws/` (a Fargate service of its own) is the option when it needs its own CPUs.
++
+ ## API
+ 
+ ```
+diff --git a/SourceCode/backend/Dockerfile b/SourceCode/backend/Dockerfile
+index 6a4dcac..b1c5478 100644
+--- a/SourceCode/backend/Dockerfile
++++ b/SourceCode/backend/Dockerfile
+@@ -1,10 +1,27 @@
+ # CPU-only image for serving (ECS Fargate has no GPU). Training on a GPU
+ # machine uses Dockerfile.gpu (docker-compose.yml).
++#
++# The SOP detector (SOP-detector/ at the repository root) runs beside the backend in this
++# image when the build is given that folder, as .github/workflows/deploy-backend.yml does:
++#     docker build --build-context sop-detector=../../SOP-detector .
++# Without it the stage below stays empty: the image is the backend alone, and
++# /sop-detector/* answers 503.
++FROM scratch AS sop-detector
++
++# The detector's folder without what the image does not need (its .dockerignore, plus
++# the sample videos).
++FROM python:3.11-slim-bookworm AS sop-detector-src
++COPY --from=sop-detector / /src/
++RUN cd /src && rm -rf .git .venv deploy docs reports samples weights cache/sop_service \
++        docker-compose.yml \
++ && find . -name __pycache__ -prune -exec rm -rf {} +
++
+ FROM python:3.11-slim-bookworm
+ 
+ RUN apt-get update && apt-get install -y --no-install-recommends \
+     libgl1 \
+     libglib2.0-0 \
++    libgomp1 \
+     tesseract-ocr \
+     tesseract-ocr-eng \
+     && rm -rf /var/lib/apt/lists/*
+@@ -25,10 +42,36 @@ RUN useradd --create-home --uid 1000 appuser
+ ENV TORCH_HOME=/app/.cache/torch
+ RUN python -c "import torchvision.models as m; m.efficientnet_b0(weights=m.EfficientNet_B0_Weights.IMAGENET1K_V1)"
+ 
++# The SOP detector. Its models were fitted under Python 3.14 with the exact library
++# versions in its requirements.txt, so it gets its own interpreter (installed by uv) and
++# virtualenv, as its own Dockerfile installs them. warmup.py bakes its OCR, YOLO and
++# ResNet weights into the image and runs it once, so a broken install fails the build.
++COPY --from=sop-detector-src /src/ /opt/sop-detector/
++RUN if [ -f /opt/sop-detector/requirements.txt ]; then \
++        pip install --no-cache-dir uv==0.13.1 \
++     && UV_PYTHON_INSTALL_DIR=/opt/python uv venv --seed --python 3.14 \
++            --python-preference only-managed /opt/sop-detector/venv \
++     && pip uninstall -y uv \
++     && cd /opt/sop-detector \
++     && venv/bin/pip install --no-cache-dir --timeout=1200 --retries=10 \
++            --index-url https://download.pytorch.org/whl/cpu torch==2.10.0 torchvision==0.25.0 \
++     && venv/bin/pip install --no-cache-dir --timeout=1200 --retries=10 -r requirements.txt \
++     && venv/bin/pip uninstall -y opencv-python \
++     && venv/bin/pip install --no-cache-dir --force-reinstall --no-deps \
++            "$(grep '^opencv-python-headless==' requirements.txt)" \
++     && SOP_DETECTOR_PKL=/opt/sop-detector/models/sop_detector.pkl \
++        EASYOCR_MODULE_PATH=/opt/sop-detector/.EasyOCR venv/bin/python warmup.py; \
++    fi
++
++COPY start.sh ./
++
+ # Models are not baked into the image: MLService downloads them from S3
+ # (MODEL_S3_BUCKET / MODEL_S3_PREFIX, see app/config.py) into /app/models at startup.
+-RUN mkdir -p /app/uploads /app/models && chown -R appuser:appuser /app
++# The detector writes only under its cache/ (uploads go to /tmp).
++RUN mkdir -p /app/uploads /app/models /opt/sop-detector/cache \
++    && chown -R appuser:appuser /app /opt/sop-detector/cache
+ USER appuser
+ EXPOSE 8000
+ ENV PYTHONUNBUFFERED=1
+-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
++# The backend on :8000, and the SOP detector beside it on 127.0.0.1:8100 when the image has it
++CMD ["sh", "start.sh"]
+diff --git a/SourceCode/backend/app/config.py b/SourceCode/backend/app/config.py
+index 72f55c6..9823c20 100644
+--- a/SourceCode/backend/app/config.py
++++ b/SourceCode/backend/app/config.py
+@@ -28,6 +28,10 @@ class Settings(BaseSettings):
+     # API key authentication (empty string = auth disabled, for local dev)
+     api_key: str = ""
+ 
++    # The SOP detector that runs beside the backend in its container (start.sh);
++    # /sop-detector/* is forwarded to it (app/routers/sop_detector.py)
++    sop_detector_url: str = "http://127.0.0.1:8100"
++
+     allowed_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
+     allowed_methods: list[str] = ["GET", "POST", "PATCH", "DELETE", "OPTIONS"]
+     allowed_headers: list[str] = ["Authorization", "Content-Type", "X-API-Key"]
+diff --git a/SourceCode/backend/app/main.py b/SourceCode/backend/app/main.py
+index 8bf8fb2..d37b07a 100644
+--- a/SourceCode/backend/app/main.py
++++ b/SourceCode/backend/app/main.py
+@@ -24,7 +24,7 @@ from app.database import engine
+ from app.middleware.auth import verify_api_key
+ from app.models.base import Base
+ from app.routers import classification, evaluation, knowledge
+-from app.routers import videos, jobs
++from app.routers import videos, jobs, sop_detector
+ 
+ limiter = Limiter(key_func=get_remote_address, default_limits=["30/minute"])
+ 
+@@ -92,6 +92,8 @@ app.include_router(evaluation.router, dependencies=_auth)
+ app.include_router(videos.router, dependencies=_auth)
+ app.include_router(jobs.router, dependencies=_auth)
+ app.include_router(knowledge.router, dependencies=_auth)
++# Its /health is open like the backend's; the job routes check the API key themselves.
++app.include_router(sop_detector.router)
+ 
+ 
+ @app.get("/health")
+diff --git a/SourceCode/backend/app/routers/sop_detector.py b/SourceCode/backend/app/routers/sop_detector.py
+new file mode 100644
+index 0000000..980637b
+--- /dev/null
++++ b/SourceCode/backend/app/routers/sop_detector.py
+@@ -0,0 +1,66 @@
++"""/sop-detector/*: the SOP detector's API, answered by the detector process that runs
++beside the backend in the same container (start.sh; SOP-detector/ at the repository root).
++
++The paths and JSON are the detector's own (SOP-detector/README.md, "API"), so the frontend
++calls them the same way here as it calls the stand-alone detector locally. While the
++detector is starting, or when the image was built without it, the routes answer 503,
++which the frontend treats as "not running".
++"""
++import re
++from collections.abc import AsyncIterator
++
++import httpx
++from fastapi import APIRouter, Depends, HTTPException, Request
++from fastapi.responses import Response
++
++from app.config import settings
++from app.middleware.auth import verify_api_key
++
++router = APIRouter(prefix="/sop-detector", tags=["sop-detector"])
++
++MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB, the same limit as /api/v1/videos/upload
++JOB_ID = re.compile(r"[0-9a-f]{12}")  # sop_detector_service.py: uuid4().hex[:12]
++
++
++async def detector_client() -> AsyncIterator[httpx.AsyncClient]:
++    async with httpx.AsyncClient(base_url=settings.sop_detector_url, timeout=60) as client:
++        yield client
++
++
++async def forward(client: httpx.AsyncClient, method: str, path: str, **kwargs) -> Response:
++    try:
++        r = await client.request(method, path, **kwargs)
++    except httpx.TransportError:
++        raise HTTPException(status_code=503, detail="The SOP detector is not running")
++    return Response(r.content, status_code=r.status_code,
++                    media_type=r.headers.get("content-type"))
++
++
++@router.get("/health")
++async def health(client: httpx.AsyncClient = Depends(detector_client)) -> Response:
++    return await forward(client, "GET", "/sop-detector/health")
++
++
++@router.post("/jobs", dependencies=[Depends(verify_api_key)])
++async def submit(request: Request,
++                 client: httpx.AsyncClient = Depends(detector_client)) -> Response:
++    too_large = HTTPException(
++        status_code=413,
++        detail=f"File too large. Maximum allowed size is {MAX_FILE_SIZE // (1024*1024)} MB")
++    if int(request.headers.get("content-length") or 0) > MAX_FILE_SIZE:
++        raise too_large
++    body = bytearray()
++    async for chunk in request.stream():
++        body += chunk
++        if len(body) > MAX_FILE_SIZE:
++            raise too_large
++    # The multipart body goes on as it came, boundary and all.
++    return await forward(client, "POST", "/sop-detector/jobs", content=bytes(body),
++                         headers={"content-type": request.headers.get("content-type", "")})
++
++
++@router.get("/jobs/{job_id}", dependencies=[Depends(verify_api_key)])
++async def status(job_id: str, client: httpx.AsyncClient = Depends(detector_client)) -> Response:
++    if not JOB_ID.fullmatch(job_id):
++        raise HTTPException(status_code=404, detail="No such detection job")
++    return await forward(client, "GET", f"/sop-detector/jobs/{job_id}")
+diff --git a/SourceCode/backend/pyproject.toml b/SourceCode/backend/pyproject.toml
+index a6b57ed..e680e1e 100644
+--- a/SourceCode/backend/pyproject.toml
++++ b/SourceCode/backend/pyproject.toml
+@@ -15,6 +15,8 @@ dependencies = [
+     "python-multipart>=0.0.12",
+     "python-docx>=1.1.0",
+     "slowapi>=0.1.9",
++    # /sop-detector/* is forwarded to the SOP detector beside the backend
++    "httpx>=0.27.0",
+ ]
+ 
+ [project.optional-dependencies]
+diff --git a/SourceCode/backend/start.sh b/SourceCode/backend/start.sh
+new file mode 100644
+index 0000000..320e301
+--- /dev/null
++++ b/SourceCode/backend/start.sh
+@@ -0,0 +1,22 @@
++#!/bin/sh
++# The container's command (Dockerfile). When the image has the SOP detector, start it in
++# the background on 127.0.0.1:8100, and start it again if it stops; then run the backend,
++# which forwards /sop-detector/* to it (app/routers/sop_detector.py). The detector lowers
++# its own CPU priority, so the backend stays responsive while a video is being read.
++if [ -x /opt/sop-detector/venv/bin/python ]; then
++    (
++        cd /opt/sop-detector || exit 0
++        export SOP_DETECTOR_HOST=127.0.0.1 SOP_DETECTOR_PORT=8100 \
++            SOP_DETECTOR_THREADS="${SOP_DETECTOR_THREADS:-2}" \
++            SOP_DETECTOR_UPLOADS=/tmp/sop-detector-uploads \
++            SOP_DETECTOR_PKL=/opt/sop-detector/models/sop_detector.pkl \
++            EASYOCR_MODULE_PATH=/opt/sop-detector/.EasyOCR
++        while true; do
++            venv/bin/python sop_detector_service.py
++            echo "SOP detector stopped (exit $?); starting it again in 10 s" >&2
++            sleep 10
++        done
++    ) &
++fi
++
++exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+diff --git a/SourceCode/backend/tests/test_sop_detector_proxy.py b/SourceCode/backend/tests/test_sop_detector_proxy.py
+new file mode 100644
+index 0000000..e2e1dba
+--- /dev/null
++++ b/SourceCode/backend/tests/test_sop_detector_proxy.py
+@@ -0,0 +1,127 @@
++"""/sop-detector/*: forwarded to the SOP detector that runs beside the backend in its
++container (app/routers/sop_detector.py, start.sh). The detector is replaced by an
++httpx.MockTransport, so these tests need neither it nor the database."""
++import httpx
++import pytest
++from fastapi import FastAPI
++
++from app.config import settings
++from app.routers import sop_detector
++
++JOB_ID = "0123456789ab"
++
++
++def make_app(handler) -> FastAPI:
++    app = FastAPI()
++    app.include_router(sop_detector.router)
++
++    async def mock_detector():
++        transport = httpx.MockTransport(handler)
++        async with httpx.AsyncClient(transport=transport, base_url="http://detector") as client:
++            yield client
++
++    app.dependency_overrides[sop_detector.detector_client] = mock_detector
++    return app
++
++
++async def call(app: FastAPI, method: str, url: str, **kwargs) -> httpx.Response:
++    transport = httpx.ASGITransport(app=app)
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        return await client.request(method, url, **kwargs)
++
++
++def not_running(request: httpx.Request) -> httpx.Response:
++    raise httpx.ConnectError("connection refused", request=request)
++
++
++@pytest.fixture
++def no_api_key(monkeypatch):
++    monkeypatch.setattr(settings, "api_key", "")
++
++
++async def test_upload_reaches_the_detector_unchanged(no_api_key):
++    seen = {}
++
++    def detector(request: httpx.Request) -> httpx.Response:
++        seen["path"] = request.url.path
++        seen["type"] = request.headers["content-type"]
++        seen["body"] = request.content
++        return httpx.Response(200, json={"job_id": JOB_ID})
++
++    files = {"file": ("clip.mp4", b"fake video bytes", "video/mp4")}
++    r = await call(make_app(detector), "POST", "/sop-detector/jobs", files=files)
++
++    assert r.status_code == 200
++    assert r.json() == {"job_id": JOB_ID}
++    assert seen["path"] == "/sop-detector/jobs"
++    assert seen["type"].startswith("multipart/form-data; boundary=")
++    assert b"fake video bytes" in seen["body"]
++
++
++async def test_job_status_comes_back_from_the_detector(no_api_key):
++    job = {"job_id": JOB_ID, "status": "running", "progress_pct": 40, "stage": "clicks",
++           "result": None, "error": None}
++
++    def detector(request: httpx.Request) -> httpx.Response:
++        assert request.url.path == f"/sop-detector/jobs/{JOB_ID}"
++        return httpx.Response(200, json=job)
++
++    r = await call(make_app(detector), "GET", f"/sop-detector/jobs/{JOB_ID}")
++    assert r.status_code == 200
++    assert r.json() == job
++
++
++async def test_detector_errors_are_passed_on(no_api_key):
++    def detector(request: httpx.Request) -> httpx.Response:
++        return httpx.Response(404, json={"detail": "No such detection job"})
++
++    r = await call(make_app(detector), "GET", f"/sop-detector/jobs/{JOB_ID}")
++    assert r.status_code == 404
++    assert r.json() == {"detail": "No such detection job"}
++
++
++async def test_a_malformed_job_id_never_reaches_the_detector(no_api_key):
++    def detector(request: httpx.Request) -> httpx.Response:
++        raise AssertionError(f"forwarded {request.url}")
++
++    for job_id in ("not-a-job", "0123456789AB", "0123456789abc", "..%2Fhealth"):
++        r = await call(make_app(detector), "GET", f"/sop-detector/jobs/{job_id}")
++        assert r.status_code == 404, job_id
++
++
++async def test_a_detector_that_is_not_running_answers_503(no_api_key):
++    app = make_app(not_running)
++    files = {"file": ("clip.mp4", b"x", "video/mp4")}
++    assert (await call(app, "GET", "/sop-detector/health")).status_code == 503
++    assert (await call(app, "POST", "/sop-detector/jobs", files=files)).status_code == 503
++    assert (await call(app, "GET", f"/sop-detector/jobs/{JOB_ID}")).status_code == 503
++
++
++async def test_a_video_over_the_limit_is_refused(no_api_key, monkeypatch):
++    monkeypatch.setattr(sop_detector, "MAX_FILE_SIZE", 1000)
++
++    def detector(request: httpx.Request) -> httpx.Response:
++        raise AssertionError("an oversized upload was forwarded")
++
++    files = {"file": ("clip.mp4", b"x" * 2000, "video/mp4")}
++    r = await call(make_app(detector), "POST", "/sop-detector/jobs", files=files)
++    assert r.status_code == 413
++
++
++async def test_jobs_need_the_api_key_when_one_is_set(monkeypatch):
++    monkeypatch.setattr(settings, "api_key", "secret")
++
++    def detector(request: httpx.Request) -> httpx.Response:
++        if request.url.path.endswith("/health"):
++            return httpx.Response(200, json={"status": "ok", "busy": False})
++        return httpx.Response(200, json={"job_id": JOB_ID})
++
++    app = make_app(detector)
++    files = {"file": ("clip.mp4", b"x", "video/mp4")}
++    assert (await call(app, "POST", "/sop-detector/jobs", files=files)).status_code == 401
++    assert (await call(app, "GET", f"/sop-detector/jobs/{JOB_ID}")).status_code == 401
++
++    key = {"X-API-Key": "secret"}
++    r = await call(app, "POST", "/sop-detector/jobs", files=files, headers=key)
++    assert r.status_code == 200
++    assert (await call(app, "GET", "/sop-detector/health")).status_code == 200
+diff --git a/SourceCode/frontend/.env.production b/SourceCode/frontend/.env.production
+new file mode 100644
+index 0000000..05d603c
+--- /dev/null
++++ b/SourceCode/frontend/.env.production
+@@ -0,0 +1,5 @@
++# Production builds (Amplify): show the SOP detector's "Steps read from the video" panel.
++# On AWS the detector runs beside the backend in its container, at /sop-detector on the
++# backend's host (src/services/api/sopDetector.ts). A variable set in the build's own
++# environment wins over this file, so docker compose, which passes "false", keeps it off.
++VITE_SOP_DETECTOR_ENABLED=true
+diff --git a/SourceCode/frontend/src/services/api/client.ts b/SourceCode/frontend/src/services/api/client.ts
+index b298445..89d8c8e 100644
+--- a/SourceCode/frontend/src/services/api/client.ts
++++ b/SourceCode/frontend/src/services/api/client.ts
+@@ -2,7 +2,7 @@ export const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '/api/v1';
+ 
+ const API_KEY = import.meta.env.VITE_API_KEY ?? '';
+ 
+-function authHeaders(): Record<string, string> {
++export function authHeaders(): Record<string, string> {
+   return API_KEY ? { 'X-API-Key': API_KEY } : {};
+ }
+ 
+diff --git a/SourceCode/frontend/src/services/api/sopDetector.test.ts b/SourceCode/frontend/src/services/api/sopDetector.test.ts
+index 7712559..10f7bd8 100644
+--- a/SourceCode/frontend/src/services/api/sopDetector.test.ts
++++ b/SourceCode/frontend/src/services/api/sopDetector.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
+-import { describeStep, detectorEnabled, detectorExpected, formatClock, parseTimeRange, startDetection, stepsInRange } from './sopDetector';
++import { describeStep, detectorEnabled, detectorExpected, detectorUrl, formatClock, parseTimeRange, startDetection, stepsInRange } from './sopDetector';
+ import type { DetectedStep } from '../../types/detection';
+ 
+ const steps: DetectedStep[] = [
+@@ -76,4 +76,50 @@ describe('startDetection', () => {
+       .mockResolvedValueOnce({ ok: true, status: 200, json: () => Promise.resolve({ job_id: 'late' }) } as Response);
+     expect(await startDetection(new File(['x'], 'clip.mp4'), 4, 0)).toBe('late');
+   });
++  it('posts to the backend\'s host in a production build', async () => {
++    vi.stubEnv('PROD', true);
++    vi.stubEnv('VITE_SOP_DETECTOR_URL', '');
++    vi.stubEnv('VITE_API_BASE_URL', 'https://d123.cloudfront.net/api/v1');
++    const fetchMock = vi.fn(() =>
++      Promise.resolve({ ok: true, json: () => Promise.resolve({ job_id: 'abc' }) } as Response));
++    globalThis.fetch = fetchMock;
++    await startDetection(new File(['x'], 'clip.mp4'));
++    expect(fetchMock).toHaveBeenCalledWith(
++      'https://d123.cloudfront.net/sop-detector/jobs', expect.objectContaining({ method: 'POST' }));
++  });
++  it('sends the API key, as the backend\'s own calls do', async () => {
++    vi.stubEnv('VITE_API_KEY', 'k');
++    vi.resetModules();
++    const { getDetection } = await import('./sopDetector');
++    const fetchMock = vi.fn(() =>
++      Promise.resolve({ ok: true, json: () => Promise.resolve({ status: 'running' }) } as Response));
++    globalThis.fetch = fetchMock;
++    await getDetection('0123456789ab');
++    expect(fetchMock).toHaveBeenCalledWith(
++      '/sop-detector/jobs/0123456789ab', { headers: { 'X-API-Key': 'k' } });
++  });
++});
++
++describe('where the detector answers', () => {
++  afterEach(() => vi.unstubAllEnvs());
++
++  it('uses VITE_SOP_DETECTOR_URL when the build sets it', () => {
++    vi.stubEnv('VITE_SOP_DETECTOR_URL', 'http://localhost:8100/sop-detector');
++    expect(detectorUrl()).toBe('http://localhost:8100/sop-detector');
++  });
++  it('is /sop-detector on the backend\'s host in a production build (on AWS it runs in the backend\'s container)', () => {
++    vi.stubEnv('PROD', true);
++    vi.stubEnv('DEV', false);
++    vi.stubEnv('VITE_SOP_DETECTOR_URL', '');
++    vi.stubEnv('VITE_API_BASE_URL', 'https://d123.cloudfront.net/api/v1');
++    expect(detectorUrl()).toBe('https://d123.cloudfront.net/sop-detector');
++    vi.stubEnv('VITE_SOP_DETECTOR_ENABLED', 'true');
++    expect(detectorExpected()).toBe(true);
++  });
++  it('stays /sop-detector on the dev server, which proxies it', () => {
++    vi.stubEnv('PROD', false);
++    vi.stubEnv('VITE_SOP_DETECTOR_URL', '');
++    vi.stubEnv('VITE_API_BASE_URL', 'http://localhost:8000/api/v1');
++    expect(detectorUrl()).toBe('/sop-detector');
++  });
+ });
+diff --git a/SourceCode/frontend/src/services/api/sopDetector.ts b/SourceCode/frontend/src/services/api/sopDetector.ts
+index 066fc75..0da890a 100644
+--- a/SourceCode/frontend/src/services/api/sopDetector.ts
++++ b/SourceCode/frontend/src/services/api/sopDetector.ts
+@@ -1,9 +1,21 @@
+ import type { DetectedStep, DetectionJob } from '../../types/detection';
++import { authHeaders } from './client';
+ 
+-// The SOP detector runs as its own small service (SOP-detector/ at the repository root);
+-// the dev server proxies /sop-detector to it, docker compose sets VITE_SOP_DETECTOR_URL.
+-const BASE = import.meta.env.VITE_SOP_DETECTOR_URL ?? '/sop-detector';
+-export const DETECTOR_URL = BASE;
++/** Where the SOP detector answers. Locally it runs as its own small service (SOP-detector/
++ *  at the repository root): the dev server proxies /sop-detector to it, and docker compose
++ *  sets VITE_SOP_DETECTOR_URL. On AWS it runs beside the backend in the backend's
++ *  container, so a production build without VITE_SOP_DETECTOR_URL calls /sop-detector on
++ *  the backend's host, taken from VITE_API_BASE_URL. Read on each call, so tests can
++ *  switch it with vi.stubEnv. */
++export function detectorUrl(): string {
++  if (import.meta.env.VITE_SOP_DETECTOR_URL) return import.meta.env.VITE_SOP_DETECTOR_URL;
++  const api = import.meta.env.VITE_API_BASE_URL;
++  if (import.meta.env.PROD && api && /^https?:\/\//.test(api)) {
++    return `${new URL(api).origin}/sop-detector`;
++  }
++  return '/sop-detector';
++}
++export const DETECTOR_URL = detectorUrl();
+ 
+ /** The SOP detector is switched off unless the build sets VITE_SOP_DETECTOR_ENABLED=true:
+  *  then videos are not sent to it, and no "Steps read from the video" panel is shown.
+@@ -12,10 +24,12 @@ export function detectorEnabled(): boolean {
+   return import.meta.env.VITE_SOP_DETECTOR_ENABLED === 'true';
+ }
+ 
+-/** Whether this build expects a running detector: switched on, and a dev server or a build
+- *  with VITE_SOP_DETECTOR_URL. Otherwise an unreachable detector shows no panel at all. */
++/** Whether this build expects a running detector: switched on, and a dev server, a build
++ *  with VITE_SOP_DETECTOR_URL, or a production build that calls the backend's host.
++ *  Otherwise an unreachable detector shows no panel at all. */
+ export function detectorExpected(): boolean {
+-  return detectorEnabled() && Boolean(import.meta.env.DEV || import.meta.env.VITE_SOP_DETECTOR_URL);
++  return detectorEnabled() && Boolean(
++    import.meta.env.DEV || import.meta.env.VITE_SOP_DETECTOR_URL || detectorUrl() !== '/sop-detector');
+ }
+ 
+ const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+@@ -30,7 +44,7 @@ export async function startDetection(file: File, attempts = 4, waitMs = 5000): P
+     try {
+       const form = new FormData();
+       form.append('file', file);
+-      const res = await fetch(`${BASE}/jobs`, { method: 'POST', body: form });
++      const res = await fetch(`${detectorUrl()}/jobs`, { method: 'POST', body: form, headers: authHeaders() });
+       if (res.ok) {
+         const body = await res.json();
+         return typeof body.job_id === 'string' ? body.job_id : null;
+@@ -44,7 +58,7 @@ export async function startDetection(file: File, attempts = 4, waitMs = 5000): P
+ }
+ 
+ export async function getDetection(jobId: string): Promise<DetectionJob> {
+-  const res = await fetch(`${BASE}/jobs/${jobId}`);
++  const res = await fetch(`${detectorUrl()}/jobs/${jobId}`, { headers: authHeaders() });
+   if (!res.ok) throw new Error(`SOP detector ${res.status}`);
+   return res.json();
+ }
+-- 
+2.43.0
+
